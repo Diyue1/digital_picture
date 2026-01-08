@@ -660,7 +660,8 @@ class VideoProcessor:
         self.tracker = None
         self.tracking = False
         self.paused = False
-        self.config = {'kalman': True, 'trail': True, 'overlay': True, 'preprocess': True, 'particles': True}
+        self.config = {'kalman': True, 'trail': True, 'overlay': True, 'preprocess': True, 'particles': True,
+                       'heatmap': False}
         self.view_mode = 'original'
         self.current_frame = None
         self.last_pos = None
@@ -670,6 +671,7 @@ class VideoProcessor:
         self.detect_counter = 0
         self.last_detected_rect = None
 
+        self.heatmap_mask = None
         self.kalman = cv2.KalmanFilter(4, 2)
         self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
         self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
@@ -813,6 +815,20 @@ class VideoProcessor:
                     speed = dist
                     accel = speed - self.last_speed
 
+                if self.config.get('heatmap') and self.tracking:
+                    # 如果尺寸不匹配或未初始化，则重置
+                    if self.heatmap_mask is None or self.heatmap_mask.shape[:2] != display_frame.shape[:2]:
+                        self.heatmap_mask = np.zeros(display_frame.shape[:2], dtype=np.float32)
+
+                    try:
+                        # 在当前坐标绘制一个淡淡的圆点，实现热力累积效果
+                        # 每次叠加 1.0 的热度，半径 15 像素
+                        cv2.circle(self.heatmap_mask, (int(cx), int(cy)), 15, (1), -1)
+                        # 为防止数值无限增大，可以做一个衰减（可选）
+                        # self.heatmap_mask *= 0.995
+                    except Exception:
+                        pass
+
                 self.last_pos = (cx, cy)
                 self.last_speed = speed
                 self.trail_history.append((cx, cy))
@@ -835,6 +851,13 @@ class VideoProcessor:
                             thickness = int(np.sqrt(i / len(pts)) * 3) + 1
                             cv2.line(display_frame, pts[i - 1], pts[i], (0, 255, 136), thickness)
 
+        if self.config['heatmap'] and self.heatmap_mask is not None:
+            # 归一化并应用颜色映射
+            norm_map = cv2.normalize(self.heatmap_mask, None, 0, 255, cv2.NORM_MINMAX)
+            norm_map = np.uint8(norm_map)
+            heatmap_color = cv2.applyColorMap(norm_map, cv2.COLORMAP_JET)
+            # 叠加 (权重可调)
+            display_frame = cv2.addWeighted(display_frame, 0.7, heatmap_color, 0.3, 0)
         output_image = display_frame
         if self.view_mode == 'preprocessed':
             output_image = preprocessed
@@ -970,4 +993,7 @@ def video_stream_task():
 if __name__ == '__main__':
     print("Starting AETHER Tracking System v4.1 Stable...")
     socketio.run(app, debug=False, port=5000, allow_unsafe_werkzeug=True)
+
+
+
 
