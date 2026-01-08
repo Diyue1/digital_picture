@@ -7,13 +7,14 @@ import time
 import datetime
 import threading
 import csv
+import shutil
 from collections import deque
-from flask import Flask, render_template_string, jsonify, send_file
+from flask import Flask, render_template_string, jsonify, send_file, request
 from flask_socketio import SocketIO, emit
 import io
 
 # =========================================================
-# 修复版 HTML 模板
+# HTML 模板 (修复了 JS 初始化顺序和安全性)
 # =========================================================
 HTML_TEMPLATE = r'''
 <!DOCTYPE html>
@@ -22,33 +23,33 @@ HTML_TEMPLATE = r'''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="shortcut icon" href="data:;"> 
-    <title>AETHER // 视觉追踪系统 v2.1 (Debug Fix)</title>
+    <title>AETHER // 视觉追踪系统 v4.1 (Stable)</title>
     <script src="https://cdn.bootcdn.net/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/Chart.js/3.7.0/chart.min.js"></script>
     <link href="https://cdn.bootcdn.net/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
         :root { 
-            --bg: #0a0a12; --panel: rgba(15, 20, 30, 0.9); --accent: #00f3ff; 
+            --bg: #0a0a12; --panel: rgba(15, 20, 30, 0.95); --accent: #00f3ff; 
             --accent-dim: rgba(0, 243, 255, 0.3); --success: #00ff88;
             --warning: #ffaa00; --danger: #ff2255; --text: #e0f7ff; --text-dim: #667788;
         }
         * { box-sizing: border-box; }
         body { margin: 0; background: linear-gradient(135deg, #0a0a12 0%, #0d1520 100%);
             color: var(--text); font-family: 'Segoe UI', 'Microsoft YaHei', monospace; overflow: hidden; }
-        .main-grid { display: grid; grid-template-columns: 200px 1fr 360px; 
+        .main-grid { display: grid; grid-template-columns: 220px 1fr 360px; 
             grid-template-rows: 1fr 180px; height: 100vh; gap: 6px; padding: 6px; }
         .panel { background: var(--panel); border: 1px solid var(--accent-dim); border-radius: 6px; 
             position: relative; overflow: hidden; backdrop-filter: blur(10px); }
         .panel-header { background: linear-gradient(90deg, rgba(0, 243, 255, 0.15), transparent);
-            color: var(--accent); padding: 10px 12px; font-size: 10px; letter-spacing: 2px; 
+            color: var(--accent); padding: 10px 12px; font-size: 11px; letter-spacing: 2px; 
             font-weight: bold; border-bottom: 1px solid var(--accent-dim); text-transform: uppercase;
             display: flex; align-items: center; gap: 8px; }
-        .panel-header i { font-size: 12px; }
         .panel-content { padding: 10px; height: calc(100% - 38px); overflow-y: auto; }
         #control-panel { grid-column: 1; grid-row: 1 / span 2; }
-        .control-section { margin-bottom: 15px; }
-        .control-section h4 { color: var(--text-dim); font-size: 9px; letter-spacing: 1px; 
+        .control-section { margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 10px; }
+        .control-section:last-child { border-bottom: none; }
+        .control-section h4 { color: var(--text-dim); font-size: 10px; letter-spacing: 1px; 
             margin: 0 0 8px 0; text-transform: uppercase; }
         .btn { width: 100%; padding: 8px; margin-bottom: 6px; background: rgba(0, 243, 255, 0.08); 
             border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 4px; 
@@ -61,7 +62,7 @@ HTML_TEMPLATE = r'''
         .btn-success:hover { background: var(--success); color: #000; }
         .btn-purple { border-color: #a855f7; color: #a855f7; background: rgba(168,85,247,0.08); }
         .btn-purple:hover { background: #a855f7; color: #fff; }
-        .btn .key { font-size: 9px; opacity: 0.6; }
+        .btn .key { font-size: 9px; opacity: 0.6; margin-left: auto; }
         .toggle-group { display: flex; flex-direction: column; gap: 6px; }
         .toggle-item { display: flex; align-items: center; justify-content: space-between;
             padding: 6px 8px; background: rgba(0,0,0,0.3); border-radius: 4px; font-size: 10px; }
@@ -72,13 +73,14 @@ HTML_TEMPLATE = r'''
             background: #fff; border-radius: 50%; top: 2px; left: 2px; transition: left 0.3s; }
         .toggle-switch.active::after { left: 18px; }
         .select-box { width: 100%; padding: 6px; background: rgba(0,0,0,0.4);
-            border: 1px solid var(--accent-dim); color: var(--text); border-radius: 4px; font-size: 10px; }
+            border: 1px solid var(--accent-dim); color: var(--text); border-radius: 4px; font-size: 10px; margin-bottom: 5px;}
         .select-box option { background: #1a1a2e; }
         #video-panel { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; }
         #video-container { flex: 1; display: flex; justify-content: center; align-items: center; 
             background: #000; position: relative; cursor: crosshair; overflow: hidden; user-select: none; }
         #video-img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; -webkit-user-drag: none; }
         #selection-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+        #particle-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 4; }
         #select-hint { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8);
             padding: 8px 16px; border-radius: 4px; font-size: 11px; color: var(--accent); pointer-events: none; z-index: 15;
             border: 1px solid var(--accent-dim); opacity: 0.9; }
@@ -137,56 +139,63 @@ HTML_TEMPLATE = r'''
         <div class="panel-header"><i class="fas fa-sliders-h"></i> 控制台</div>
         <div class="panel-content">
             <div class="control-section">
-                <h4>追踪控制</h4>
-                <button class="btn" id="btn-pause"><i class="fas fa-pause"></i> 暂停 <span class="key">[空格]</span></button>
-                <button class="btn btn-danger" id="btn-reset"><i class="fas fa-redo"></i> 重置 <span class="key">[R]</span></button>
-                <button class="btn btn-purple" id="btn-screenshot"><i class="fas fa-camera"></i> 截图 <span class="key">[S]</span></button>
-                <button class="btn btn-success" id="btn-export"><i class="fas fa-download"></i> 导出 <span class="key">[E]</span></button>
-            </div>
-            <div class="control-section">
-                <h4>追踪算法</h4>
-                <select class="select-box" id="tracker-select">
-                    <option value="CSRT">CSRT (精确)</option>
-                    <option value="KCF">KCF (快速)</option>
-                    <option value="MIL">MIL (稳定)</option>
-                    <option value="MOSSE">MOSSE (极速)</option>
-                </select>
-            </div>
-            <div class="control-section">
-                <h4>功能开关</h4>
-                <div class="toggle-group">
-                    <div class="toggle-item"><span>卡尔曼滤波 [K]</span><div class="toggle-switch active" id="toggle-kalman"></div></div>
-                    <div class="toggle-item"><span>轨迹显示 [T]</span><div class="toggle-switch active" id="toggle-trail"></div></div>
-                    <div class="toggle-item"><span>战术叠加</span><div class="toggle-switch active" id="toggle-overlay"></div></div>
-                    <div class="toggle-item"><span>热力图 [H]</span><div class="toggle-switch" id="toggle-heatmap"></div></div>
-                    <div class="toggle-item"><span>🎵 音乐化 [M]</span><div class="toggle-switch" id="toggle-music"></div></div>
+                <h4><i class="fas fa-file-video"></i> 视频输入源</h4>
+                <input type="file" id="video-upload" accept="video/*" style="display:none">
+                <button class="btn" onclick="document.getElementById('video-upload').click()">
+                    <i class="fas fa-upload"></i> 选择视频文件 <span class="key">[U]</span>
+                </button>
+                <button class="btn btn-purple" id="btn-camera" style="margin-top:5px;">
+                    <i class="fas fa-camera"></i> 切换至摄像头
+                </button>
+                <div id="upload-status" style="font-size:10px;color:var(--text-dim);margin-top:6px;text-align:center;">
+                    当前: 默认源
                 </div>
             </div>
+
             <div class="control-section">
-                <h4>⏰ 时间旅行</h4>
+                <h4>图像源与处理</h4>
+                <select class="select-box" id="view-mode-select">
+                    <option value="original">原始图像 (Original)</option>
+                    <option value="preprocessed">预处理图像 (Preprocessed)</option>
+                    <option value="mask">运动掩膜 (Binary Mask)</option>
+                </select>
+                <div class="toggle-item"><span>图像预处理</span><div class="toggle-switch active" id="toggle-preprocess"></div></div>
+                <button class="btn btn-purple" id="btn-auto-detect" style="margin-top:5px;"><i class="fas fa-magic"></i> 智能自动检测 <span class="key">[A]</span></button>
+            </div>
+
+            <div class="control-section">
+                <h4>追踪控制</h4>
+                <button class="btn" id="btn-pause"><i class="fas fa-pause"></i> 暂停 <span class="key">[SPACE]</span></button>
+                <button class="btn btn-danger" id="btn-reset"><i class="fas fa-redo"></i> 重置 <span class="key">[R]</span></button>
+                <button class="btn btn-success" id="btn-export"><i class="fas fa-download"></i> 导出数据 <span class="key">[E]</span></button>
+            </div>
+
+            <div class="control-section">
+                <h4>可视化与音效 (创新点)</h4>
+                <div class="toggle-group">
+                    <div class="toggle-item"><span>卡尔曼滤波 [K]</span><div class="toggle-switch active" id="toggle-kalman"></div></div>
+                    <div class="toggle-item"><span>粒子特效 [P]</span><div class="toggle-switch active" id="toggle-particles"></div></div>
+                    <div class="toggle-item"><span>信息叠加 [O]</span><div class="toggle-switch active" id="toggle-overlay"></div></div>
+                    <div class="toggle-item"><span>热力图 [H]</span><div class="toggle-switch" id="toggle-heatmap"></div></div>
+                    <div class="toggle-item"><span>🎵 空间音效 [M]</span><div class="toggle-switch" id="toggle-music"></div></div>
+                </div>
+            </div>
+
+            <div class="control-section">
+                <h4>时间轴与回放</h4>
                 <div style="background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;">
                     <div style="font-size:9px;color:var(--text-dim);margin-bottom:4px;">
                         <span id="frame-info">帧: 0 / 0</span>
                     </div>
                     <input type="range" id="timeline-slider" min="0" max="100" value="0" 
                         style="width:100%;height:4px;background:rgba(0,243,255,0.2);border-radius:2px;outline:none;cursor:pointer;">
-                    <div style="margin-top:8px;">
-                        <button class="btn" style="font-size:9px;padding:4px 8px;" id="btn-keyframes">
-                            <i class="fas fa-star"></i> 关键帧 (<span id="keyframe-count">0</span>)
-                        </button>
-                    </div>
-                </div>
-            </div>
-            <div class="control-section">
-                <h4>报警设置</h4>
-                <div class="toggle-item"><span>速度阈值</span>
-                    <input type="number" value="25" min="5" max="100" style="width:50px;padding:3px;background:#222;border:1px solid #444;color:#fff;border-radius:3px;font-size:10px;" id="alert-threshold">
                 </div>
             </div>
         </div>
     </div>
+
     <div class="panel" id="video-panel">
-        <div class="panel-header"><i class="fas fa-video"></i> 光学传感器 // 实时画面</div>
+        <div class="panel-header"><i class="fas fa-video"></i> 实时监控画面</div>
         <div id="video-container">
             <div id="hud-overlay">
                 <div class="hud-item hud-rec"><i class="fas fa-circle"></i> REC <span id="hud-time">00:00:00</span></div>
@@ -194,11 +203,13 @@ HTML_TEMPLATE = r'''
             </div>
             <img id="video-img" src="" alt="等待视频流..." draggable="false">
             <canvas id="selection-layer"></canvas>
-            <div id="select-hint">🎯 在画面上拖拽框选目标开始追踪</div>
+            <canvas id="particle-layer"></canvas>
+            <div id="select-hint">🎯 拖拽框选目标 或 点击"智能自动检测"</div>
         </div>
     </div>
+
     <div class="panel" id="telemetry-panel">
-        <div class="panel-header"><i class="fas fa-tachometer-alt"></i> 遥测数据</div>
+        <div class="panel-header"><i class="fas fa-tachometer-alt"></i> 状态遥测</div>
         <div class="panel-content">
             <div class="gauge-container">
                 <div class="gauge"><canvas id="speed-gauge"></canvas><div class="gauge-label">速度</div></div>
@@ -208,10 +219,6 @@ HTML_TEMPLATE = r'''
                 <div class="metric-label">当前速度</div>
                 <div class="metric-value" id="val-speed">0.0<span class="metric-unit">px/f</span></div>
             </div>
-            <div class="metric-card" style="border-color: var(--danger);">
-                <div class="metric-label">加速度</div>
-                <div class="metric-value" id="val-accel" style="color: var(--danger);">0.0<span class="metric-unit">px/f²</span></div>
-            </div>
             <div class="metric-card" style="border-color: var(--success);">
                 <div class="metric-label">目标坐标</div>
                 <div class="metric-value" id="val-coord" style="font-size:16px; color: var(--success);">X:--- Y:---</div>
@@ -220,447 +227,414 @@ HTML_TEMPLATE = r'''
                 <div class="metric-label">运动状态</div>
                 <div style="margin-top:4px;"><span class="state-badge state-idle" id="motion-state">IDLE</span></div>
             </div>
-            <div class="metric-card" style="border-color: #ff6b9d;">
-                <div class="metric-label">🎵 当前音符</div>
-                <div class="metric-value" id="val-music-note" style="font-size:16px; color: #ff6b9d;">---</div>
-                <div style="font-size:8px;color:var(--text-dim);margin-top:4px;" id="music-instrument">等待追踪...</div>
-            </div>
             <div class="metric-card" style="border-color: #a855f7;">
-                <div class="metric-label">追踪统计</div>
+                <div class="metric-label">数据统计</div>
                 <div class="stats-grid">
                     <div class="stat-item"><div class="stat-label">最大速度</div><div class="stat-value" id="stat-max-speed">0.0</div></div>
-                    <div class="stat-item"><div class="stat-label">平均速度</div><div class="stat-value" id="stat-avg-speed">0.0</div></div>
                     <div class="stat-item"><div class="stat-label">移动距离</div><div class="stat-value" id="stat-distance">0</div></div>
-                    <div class="stat-item"><div class="stat-label">追踪时长</div><div class="stat-value" id="val-duration">00:00</div></div>
                 </div>
             </div>
         </div>
     </div>
+
     <div class="panel" id="chart-box">
-        <div class="panel-header"><i class="fas fa-chart-line"></i> 速度/加速度 时间线</div>
+        <div class="panel-header"><i class="fas fa-chart-line"></i> 运动曲线分析</div>
         <div id="chart-container"><canvas id="velocityChart"></canvas></div>
     </div>
+
     <div class="panel" id="three-panel">
-        <div class="panel-header"><i class="fas fa-cube"></i> 3D 空间轨迹</div>
+        <div class="panel-header"><i class="fas fa-cube"></i> 3D 轨迹重构</div>
         <div id="three-container"></div>
     </div>
 </div>
+
 <script>
+    // ==========================================
+    // 关键修正：全局变量前置声明 (Fix for ReferenceError)
+    // ==========================================
     const socket = io();
-    let isPaused = false, trackingStartTime = null, lastSpeed = 0, alertThreshold = 25;
-    const config = { kalman: true, trail: true, overlay: true, heatmap: false, tracker: 'CSRT', music: false };
-    const stats = { maxSpeed: 0, totalSpeed: 0, speedCount: 0, totalDistance: 0, lastX: 0, lastY: 0 };
-    let keyframes = [];
+    let isPaused = false, trackingStartTime = null;
+    let particles = []; // 粒子系统
+    let scene, camera, renderer, sphere, line, positions; // 3D变量
     let audioContext = null;
     let isDraggingTimeline = false;
+    let isDragging = false, startX, startY;
+
+    const config = { kalman: true, trail: true, overlay: true, heatmap: false, music: false, preprocess: true, particles: true };
+    const stats = { maxSpeed: 0, totalDistance: 0, lastX: 0, lastY: 0 };
+
+    // DOM 元素获取 (统一放在最前面)
     const imgEl = document.getElementById('video-img');
     const canvas = document.getElementById('selection-layer');
+    const particleCanvas = document.getElementById('particle-layer');
     const ctx = canvas.getContext('2d');
+    const pCtx = particleCanvas.getContext('2d');
     const speedEl = document.getElementById('val-speed');
-    const accelEl = document.getElementById('val-accel');
     const coordEl = document.getElementById('val-coord');
     const stateEl = document.getElementById('motion-state');
-    const durationEl = document.getElementById('val-duration');
     const hudStatus = document.getElementById('hud-status');
-    const hudTime = document.getElementById('hud-time');
+    const uploadStatus = document.getElementById('upload-status');
+    const videoContainer = document.getElementById('video-container');
 
-    function addLog(msg, type = 'info') {
-        console.log('[' + type.toUpperCase() + '] ' + msg);
+    // ==========================================
+    // 核心函数定义
+    // ==========================================
+    function showToast(msg, duration=2000) {
+        const toast = document.getElementById('toast');
+        if(toast) {
+            toast.innerText = msg; toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), duration);
+        }
     }
 
-    function showToast(msg, duration = 2000) {
-        const toast = document.getElementById('toast');
-        toast.innerText = msg;
-        toast.classList.add('show');
-        setTimeout(() => toast.classList.remove('show'), duration);
+    function reset3DTrail() { 
+        if(positions) positions.fill(0); 
     }
 
     function resetStats() {
-        stats.maxSpeed = 0; stats.totalSpeed = 0; stats.speedCount = 0;
-        stats.totalDistance = 0; stats.lastX = 0; stats.lastY = 0;
-        document.getElementById('stat-max-speed').innerText = '0.0';
-        document.getElementById('stat-avg-speed').innerText = '0.0';
-        document.getElementById('stat-distance').innerText = '0';
+        stats.maxSpeed = 0; stats.totalDistance = 0; stats.lastX = 0; stats.lastY = 0;
+        if(document.getElementById('stat-max-speed')) document.getElementById('stat-max-speed').innerText = '0.0';
+        if(document.getElementById('stat-distance')) document.getElementById('stat-distance').innerText = '0';
         reset3DTrail();
+        particles = [];
     }
 
     function updateStats(speed, x, y) {
         if(speed > stats.maxSpeed) stats.maxSpeed = speed;
-        stats.totalSpeed += speed;
-        stats.speedCount++;
         if(stats.lastX > 0) stats.totalDistance += Math.sqrt(Math.pow(x - stats.lastX, 2) + Math.pow(y - stats.lastY, 2));
         stats.lastX = x; stats.lastY = y;
-        document.getElementById('stat-max-speed').innerText = stats.maxSpeed.toFixed(1);
-        document.getElementById('stat-avg-speed').innerText = (stats.totalSpeed / stats.speedCount).toFixed(1);
-        document.getElementById('stat-distance').innerText = Math.round(stats.totalDistance);
+        if(document.getElementById('stat-max-speed')) document.getElementById('stat-max-speed').innerText = stats.maxSpeed.toFixed(1);
+        if(document.getElementById('stat-distance')) document.getElementById('stat-distance').innerText = Math.round(stats.totalDistance);
     }
 
-    let isDragging = false, startX, startY;
-    const selectHint = document.getElementById('select-hint');
-
-    function resizeOverlay() {
-        const container = document.getElementById('video-container');
-        canvas.width = container.clientWidth;
-        canvas.height = container.clientHeight;
-        canvas.style.top = "0px";
-        canvas.style.left = "0px";
-    }
-    imgEl.onload = resizeOverlay;
-    window.onresize = resizeOverlay;
-    setTimeout(resizeOverlay, 100);
-
-    const videoContainer = document.getElementById('video-container');
-
-    function getMousePos(e) {
+    // ==========================================
+    // 创新功能：粒子系统 (Particle System)
+    // ==========================================
+    function resizeCanvas() {
+        if(!videoContainer) return;
         const rect = videoContainer.getBoundingClientRect();
-        return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        if(particleCanvas) { particleCanvas.width = rect.width; particleCanvas.height = rect.height; }
+        if(canvas) { canvas.width = rect.width; canvas.height = rect.height; }
     }
+    if(videoContainer) new ResizeObserver(resizeCanvas).observe(videoContainer);
 
-    videoContainer.addEventListener('mousedown', e => {
-        e.preventDefault();
-        if(isPaused) { showToast('⚠ 请先继续播放'); return; }
-        isDragging = true;
-        const pos = getMousePos(e);
-        startX = pos.x; startY = pos.y;
-        if(selectHint) selectHint.classList.add('hidden');
-    });
-
-    videoContainer.addEventListener('mousemove', e => {
-        e.preventDefault();
-        if(!isDragging) return;
-        const pos = getMousePos(e);
-        const curX = pos.x, curY = pos.y;
-        const x = Math.min(startX, curX), y = Math.min(startY, curY);
-        const w = Math.abs(curX - startX), h = Math.abs(curY - startY);
-
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        // 半透明填充
-        ctx.fillStyle = 'rgba(0, 243, 255, 0.2)';
-        ctx.fillRect(x, y, w, h);
-        // 虚线边框
-        ctx.strokeStyle = '#00f3ff'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
-        ctx.strokeRect(x, y, w, h);
-        ctx.setLineDash([]);
-        // 四角标记
-        const cornerLen = Math.min(15, w/3, h/3);
-        ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(x, y + cornerLen); ctx.lineTo(x, y); ctx.lineTo(x + cornerLen, y);
-        ctx.moveTo(x + w - cornerLen, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + cornerLen);
-        ctx.moveTo(x + w, y + h - cornerLen); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - cornerLen, y + h);
-        ctx.moveTo(x + cornerLen, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - cornerLen);
-        ctx.stroke();
-        // 中心十字
-        const cx = x + w/2, cy = y + h/2;
-        ctx.strokeStyle = '#ff2255'; ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
-        ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
-        ctx.stroke();
-        // 尺寸显示
-        ctx.fillStyle = '#00f3ff'; ctx.font = '11px Consolas';
-        ctx.fillText(Math.round(w) + ' x ' + Math.round(h), x + 4, y - 6);
-    });
-
-    videoContainer.addEventListener('mouseup', e => {
-        if(!isDragging) return;
-        isDragging = false;
-        const pos = getMousePos(e);
-        const endX = pos.x, endY = pos.y;
-        const containerW = videoContainer.clientWidth, containerH = videoContainer.clientHeight;
-
-        const selW = Math.abs(endX - startX), selH = Math.abs(endY - startY);
-        if(selW > 20 && selH > 20) {
-            const payload = { 
-                x: Math.min(startX, endX) / containerW, 
-                y: Math.min(startY, endY) / containerH,
-                w: selW / containerW, 
-                h: selH / containerH 
-            };
-            socket.emit('start_tracking', payload);
-            trackingStartTime = Date.now(); resetStats();
-            addLog('目标锁定 [' + Math.round(selW) + 'x' + Math.round(selH) + ']', 'info');
-            hudStatus.innerText = '追踪中'; hudStatus.style.color = '#00ff88';
-            showToast('🎯 目标已锁定');
-        } else if(selW > 5 || selH > 5) {
-            showToast('⚠ 选框太小，请框选更大区域');
+    class Particle {
+        constructor(x, y, speed) {
+            this.x = x; this.y = y;
+            this.vx = (Math.random() - 0.5) * 2;
+            this.vy = (Math.random() - 0.5) * 2;
+            this.life = 1.0;
+            this.color = speed > 15 ? `255, 34, 85` : `0, 243, 255`; 
+            this.size = Math.random() * 3 + 1;
         }
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-    });
-
-    videoContainer.addEventListener('mouseleave', () => {
-        if(isDragging) { isDragging = false; ctx.clearRect(0, 0, canvas.width, canvas.height); }
-    });
-
-    function togglePause() {
-        isPaused = !isPaused;
-        const btn = document.getElementById('btn-pause');
-        btn.innerHTML = isPaused ? '<i class="fas fa-play"></i> 继续 <span class="key">[空格]</span>' : '<i class="fas fa-pause"></i> 暂停 <span class="key">[空格]</span>';
-        socket.emit('toggle_pause', { paused: isPaused });
-        addLog(isPaused ? '系统已暂停' : '系统继续运行', 'warn');
-        showToast(isPaused ? '⏸ 已暂停' : '▶ 继续');
-    }
-    function resetTracking() {
-        socket.emit('reset_tracking'); trackingStartTime = null; resetStats();
-        addLog('追踪已重置', 'warn'); hudStatus.innerText = '待命'; hudStatus.style.color = '#00f3ff';
-        stateEl.className = 'state-badge state-idle'; stateEl.innerText = 'IDLE';
-        showToast('🔄 已重置');
-    }
-    function takeScreenshot() {
-        document.getElementById('screenshot-flash').classList.add('active');
-        setTimeout(() => document.getElementById('screenshot-flash').classList.remove('active'), 300);
-        const link = document.createElement('a'); link.href = imgEl.src;
-        link.download = 'screenshot_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.jpg';
-        link.click(); addLog('截图已保存', 'info'); showToast('📷 截图已保存');
-    }
-    function exportData() { addLog('导出数据...', 'info'); window.location.href = '/export_data'; showToast('📥 导出中...'); }
-
-    // 音乐化追踪：播放音符
-    function playMusicNote(note, velocity, instrument) {
-        if(!audioContext) {
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        update() {
+            this.x += this.vx; this.y += this.vy;
+            this.life -= 0.04;
         }
-
-        const oscillator = audioContext.createOscillator();
-        const gainNode = audioContext.createGain();
-
-        // MIDI音符转频率
-        const frequency = 440 * Math.pow(2, (note - 69) / 12);
-        oscillator.frequency.value = frequency;
-
-        // 根据乐器选择波形
-        if(instrument === 'piano') oscillator.type = 'sine';
-        else if(instrument === 'violin') oscillator.type = 'triangle';
-        else if(instrument === 'drums') oscillator.type = 'square';
-        else oscillator.type = 'sine';
-
-        // 音量
-        gainNode.gain.value = velocity / 127 * 0.3;
-
-        oscillator.connect(gainNode);
-        gainNode.connect(audioContext.destination);
-
-        oscillator.start(audioContext.currentTime);
-        oscillator.stop(audioContext.currentTime + 0.15);
-    }
-
-    // 时间旅行：跳转到指定帧
-    function seekToFrame(frameNum) {
-        socket.emit('seek_to_frame', { frame_num: frameNum });
-        showToast('⏰ 时间旅行到帧 ' + frameNum);
-    }
-
-    // 显示关键帧列表
-    function showKeyframes() {
-        if(keyframes.length === 0) {
-            showToast('⚠ 暂无关键帧');
-            return;
+        draw(ctx) {
+            ctx.fillStyle = `rgba(${this.color}, ${this.life})`;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+            ctx.fill();
         }
+    }
 
-        let msg = '🌟 关键帧列表:\n';
-        keyframes.slice(-5).forEach((kf, idx) => {
-            msg += `\n${kf.event} - 帧${kf.frame_num} (速度:${kf.speed.toFixed(1)})`;
+    function animateParticles() {
+        if(!pCtx) return;
+        if(!config.particles) { pCtx.clearRect(0, 0, particleCanvas.width, particleCanvas.height); requestAnimationFrame(animateParticles); return; }
+        pCtx.clearRect(0, 0, particleCanvas.width, particleCanvas.height);
+        for(let i = particles.length - 1; i >= 0; i--) {
+            particles[i].update();
+            particles[i].draw(pCtx);
+            if(particles[i].life <= 0) particles.splice(i, 1);
+        }
+        requestAnimationFrame(animateParticles);
+    }
+    animateParticles();
+
+    // ==========================================
+    // 创新功能：音乐化 + 空间音频
+    // ==========================================
+    const noteFrequencies = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25]; 
+
+    function playSpatialNote(speed, x_pos, width) {
+        if(!config.music) return;
+        if(!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        const panner = audioContext.createStereoPanner(); 
+
+        const index = Math.min(Math.floor(speed / 5), noteFrequencies.length - 1);
+        osc.frequency.value = noteFrequencies[index];
+        const panValue = Math.max(-1, Math.min(1, (x_pos / width - 0.5) * 2));
+        panner.pan.value = panValue;
+        gain.gain.value = Math.min(0.2, speed * 0.01);
+
+        osc.connect(panner); panner.connect(gain); gain.connect(audioContext.destination);
+        osc.start(); osc.stop(audioContext.currentTime + 0.15);
+    }
+
+    // ==========================================
+    // 3D 场景初始化
+    // ==========================================
+    function init3D() {
+        const c = document.getElementById('three-container');
+        if(!c) return;
+        scene = new THREE.Scene(); 
+        camera = new THREE.PerspectiveCamera(60, c.clientWidth/c.clientHeight, 0.1, 100);
+        renderer = new THREE.WebGLRenderer({alpha: true, antialias: true});
+        renderer.setSize(c.clientWidth, c.clientHeight);
+        renderer.setClearColor(0x000000, 0);
+        c.appendChild(renderer.domElement);
+        const grid = new THREE.GridHelper(20, 20, 0x00f3ff, 0x222222);
+        grid.rotation.x = Math.PI/2; scene.add(grid);
+        sphere = new THREE.Mesh(new THREE.SphereGeometry(0.5), new THREE.MeshBasicMaterial({color: 0xff2255}));
+        scene.add(sphere);
+        positions = new Float32Array(300);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        line = new THREE.Line(geo, new THREE.LineBasicMaterial({color: 0x00f3ff}));
+        scene.add(line);
+        camera.position.set(0, 0, 20);
+        function animate() { requestAnimationFrame(animate); renderer.render(scene, camera); }
+        animate();
+    }
+
+    function update3D(x, y, w, h) {
+        if(!sphere || !positions) return;
+        const nx = (x/w - 0.5) * 20, ny = -(y/h - 0.5) * 20; 
+        sphere.position.set(nx, ny, 0);
+        for(let i=299; i>=3; i--) positions[i] = positions[i-3];
+        positions[0] = nx; positions[1] = ny; positions[2] = 0;
+        line.geometry.attributes.position.needsUpdate = true;
+    }
+
+    init3D();
+
+    // ==========================================
+    // 事件监听 (安全绑定) (Fix for TypeError)
+    // ==========================================
+    const uploadBtn = document.getElementById('video-upload');
+    if(uploadBtn) {
+        uploadBtn.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const formData = new FormData(); formData.append('video', file);
+            if(uploadStatus) uploadStatus.innerText = '📤 正在上传...';
+            showToast('📤 开始上传视频...');
+            try {
+                const response = await fetch('/upload_video', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (result.success) {
+                    if(uploadStatus) uploadStatus.innerText = '✅ ' + file.name;
+                    showToast('✅ 视频加载成功');
+                    resetStats(); 
+                    if(document.getElementById('btn-reset')) document.getElementById('btn-reset').click();
+                } else { showToast('❌ 上传失败: ' + result.error); }
+            } catch (err) { showToast('❌ 上传出错'); }
         });
-        addLog(msg, 'info');
-        showToast(`📍 共${keyframes.length}个关键帧`);
     }
 
-    document.getElementById('btn-pause').addEventListener('click', togglePause);
-    document.getElementById('btn-reset').addEventListener('click', resetTracking);
-    document.getElementById('btn-screenshot').addEventListener('click', takeScreenshot);
-    document.getElementById('btn-export').addEventListener('click', exportData);
-    document.getElementById('btn-keyframes').addEventListener('click', showKeyframes);
+    const cameraBtn = document.getElementById('btn-camera');
+    if(cameraBtn) {
+        cameraBtn.addEventListener('click', () => {
+            socket.emit('switch_source', { type: 'camera' });
+            if(uploadStatus) uploadStatus.innerText = '📷 摄像头模式'; 
+            showToast('📷 已切换至摄像头'); resetStats();
+        });
+    }
 
-    // 时间线滑块控制
-    const timelineSlider = document.getElementById('timeline-slider');
-    timelineSlider.addEventListener('mousedown', () => { isDraggingTimeline = true; });
-    timelineSlider.addEventListener('mouseup', e => {
-        isDraggingTimeline = false;
-        const frameNum = parseInt(e.target.value);
-        seekToFrame(frameNum);
+    if(videoContainer) {
+        videoContainer.addEventListener('mousedown', e => {
+            if(isPaused) return;
+            isDragging = true;
+            const rect = videoContainer.getBoundingClientRect();
+            startX = e.clientX - rect.left; startY = e.clientY - rect.top;
+            if(document.getElementById('select-hint')) document.getElementById('select-hint').classList.add('hidden');
+        });
+
+        videoContainer.addEventListener('mousemove', e => {
+            if(!isDragging) return;
+            const rect = videoContainer.getBoundingClientRect();
+            const curX = e.clientX - rect.left, curY = e.clientY - rect.top;
+            const x = Math.min(startX, curX), y = Math.min(startY, curY);
+            const w = Math.abs(curX - startX), h = Math.abs(curY - startY);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = '#00f3ff'; ctx.lineWidth = 2; ctx.strokeRect(x,y,w,h);
+            ctx.fillStyle = 'rgba(0, 243, 255, 0.2)'; ctx.fillRect(x,y,w,h);
+        });
+
+        videoContainer.addEventListener('mouseup', e => {
+            if(!isDragging) return;
+            isDragging = false;
+            const rect = videoContainer.getBoundingClientRect();
+            const endX = e.clientX - rect.left, endY = e.clientY - rect.top;
+            const w = Math.abs(endX - startX), h = Math.abs(endY - startY);
+            if(w > 10 && h > 10) {
+                const payload = { 
+                    x: Math.min(startX, endX) / rect.width, y: Math.min(startY, endY) / rect.height,
+                    w: w / rect.width, h: h / rect.height 
+                };
+                socket.emit('start_tracking', payload);
+                trackingStartTime = Date.now(); resetStats();
+                if(hudStatus) { hudStatus.innerText = '手动追踪'; hudStatus.style.color = '#00ff88'; }
+                showToast('🎯 目标已锁定');
+            }
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        });
+    }
+
+    // 绑定其他按钮
+    const btnPause = document.getElementById('btn-pause');
+    if(btnPause) btnPause.addEventListener('click', () => {
+        isPaused = !isPaused; socket.emit('toggle_pause', { paused: isPaused });
+        showToast(isPaused ? '⏸ 已暂停' : '▶ 继续');
     });
-    document.getElementById('tracker-select').addEventListener('change', e => {
-        config.tracker = e.target.value;
-        socket.emit('change_tracker', { tracker: config.tracker });
-        addLog('切换算法: ' + config.tracker, 'info');
+
+    const btnReset = document.getElementById('btn-reset');
+    if(btnReset) btnReset.addEventListener('click', () => {
+        socket.emit('reset_tracking'); resetStats();
+        if(hudStatus) { hudStatus.innerText = '待命'; hudStatus.style.color = '#00f3ff'; }
+        if(stateEl) { stateEl.className = 'state-badge state-idle'; stateEl.innerText = 'IDLE'; }
+        showToast('🔄 已重置');
     });
-    document.getElementById('alert-threshold').addEventListener('change', e => {
-        alertThreshold = parseInt(e.target.value);
-        socket.emit('set_threshold', { threshold: alertThreshold });
-        addLog('报警阈值: ' + alertThreshold, 'info');
+
+    const btnExport = document.getElementById('btn-export');
+    if(btnExport) btnExport.addEventListener('click', () => { window.location.href = '/export_data'; showToast('📥 正在下载数据...'); });
+
+    const btnAutoDetect = document.getElementById('btn-auto-detect');
+    if(btnAutoDetect) btnAutoDetect.addEventListener('click', () => {
+        socket.emit('auto_detect'); 
+        if(hudStatus) hudStatus.innerText = '智能检测中...';
+        showToast('🔍 正在智能分析运动轨迹...');
     });
+
+    const viewSelect = document.getElementById('view-mode-select');
+    if(viewSelect) viewSelect.addEventListener('change', e => { socket.emit('set_view_mode', { mode: e.target.value }); });
+
+    const trackerSelect = document.getElementById('tracker-select');
+    if(trackerSelect) trackerSelect.addEventListener('change', e => { socket.emit('change_tracker', { tracker: e.target.value }); });
+
+    const timeline = document.getElementById('timeline-slider');
+    if(timeline) {
+        timeline.addEventListener('input', (e) => { isDraggingTimeline = true; });
+        timeline.addEventListener('change', (e) => {
+            isDraggingTimeline = false; socket.emit('seek_frame', { frame: parseInt(e.target.value) });
+        });
+    }
+
     document.querySelectorAll('.toggle-switch').forEach(el => {
         el.addEventListener('click', () => {
             el.classList.toggle('active');
-            const id = el.id.replace('toggle-', '');
-            config[id] = el.classList.contains('active');
+            const id = el.id.replace('toggle-', ''); config[id] = el.classList.contains('active');
             socket.emit('update_config', config);
-            addLog(id + ' ' + (config[id] ? '启用' : '禁用'));
         });
     });
 
     document.addEventListener('keydown', e => {
         if(e.target.tagName === 'INPUT') return;
         switch(e.key.toLowerCase()) {
-            case ' ': e.preventDefault(); togglePause(); break;
-            case 'r': resetTracking(); break;
-            case 's': takeScreenshot(); break;
-            case 'e': exportData(); break;
-            case 'k': document.getElementById('toggle-kalman').click(); break;
-            case 't': document.getElementById('toggle-trail').click(); break;
-            case 'h': document.getElementById('toggle-heatmap').click(); break;
-            case 'm': document.getElementById('toggle-music').click(); break;
+            case ' ': e.preventDefault(); if(btnPause) btnPause.click(); break;
+            case 'r': if(btnReset) btnReset.click(); break;
+            case 'a': if(btnAutoDetect) btnAutoDetect.click(); break;
+            case 'u': if(uploadBtn) uploadBtn.click(); break;
+            case 'p': if(document.getElementById('toggle-particles')) document.getElementById('toggle-particles').click(); break;
+            case 'm': if(document.getElementById('toggle-music')) document.getElementById('toggle-music').click(); break;
         }
     });
 
-    const ctxChart = document.getElementById('velocityChart').getContext('2d');
-    const chart = new Chart(ctxChart, {
-        type: 'line',
-        data: { labels: Array(60).fill(''),
-            datasets: [{ label: '速度', data: Array(60).fill(0), borderColor: '#00f3ff',
-                backgroundColor: 'rgba(0, 243, 255, 0.1)', borderWidth: 2, fill: true, tension: 0.4, pointRadius: 0, yAxisID: 'y' },
-            { label: '加速度', data: Array(60).fill(0), borderColor: '#ff2255', borderWidth: 1, fill: false, tension: 0.4, pointRadius: 0, yAxisID: 'y1' }]
-        },
-        options: { responsive: true, maintainAspectRatio: false, animation: false,
-            plugins: { legend: { display: true, position: 'top', labels: { color: '#888', font: { size: 9 } } } },
-            scales: { x: { display: false },
-                y: { type: 'linear', position: 'left', grid: { color: '#222' }, ticks: { color: '#00f3ff', font: { size: 9 } } },
-                y1: { type: 'linear', position: 'right', grid: { drawOnChartArea: false }, ticks: { color: '#ff2255', font: { size: 9 } } }
+    // Chart init
+    const ctxChart = document.getElementById('velocityChart');
+    let chart;
+    if(ctxChart) {
+        chart = new Chart(ctxChart.getContext('2d'), {
+            type: 'line',
+            data: { labels: Array(50).fill(''),
+                datasets: [{ label: '速度', data: Array(50).fill(0), borderColor: '#00f3ff', borderWidth: 2, tension: 0.4, pointRadius: 0 }]
+            },
+            options: { responsive: true, maintainAspectRatio: false, 
+                plugins: { legend: { display: false } },
+                scales: { x: { display: false }, y: { grid: { color: '#222' }, ticks: { color: '#00f3ff' } } }
             }
-        }
-    });
+        });
+    }
 
-    function drawGauge(canvasId, value, maxVal, color) {
-        const cvs = document.getElementById(canvasId);
+    function drawGauge(id, val, max, color) {
+        const cvs = document.getElementById(id);
+        if(!cvs) return;
         const c = cvs.getContext('2d');
-        const w = cvs.width, h = cvs.height, cx = w/2, cy = h/2, r = Math.min(w,h)/2 - 6;
-        c.clearRect(0, 0, w, h);
-        c.beginPath(); c.arc(cx, cy, r, 0.75 * Math.PI, 2.25 * Math.PI);
+        const cx = cvs.width/2, cy = cvs.height/2, r = cvs.width/2 - 5;
+        c.clearRect(0,0,cvs.width,cvs.height);
+        c.beginPath(); c.arc(cx,cy,r,0.75*Math.PI, 2.25*Math.PI);
         c.strokeStyle = '#333'; c.lineWidth = 5; c.stroke();
-        const ratio = Math.min(value / maxVal, 1);
-        c.beginPath(); c.arc(cx, cy, r, 0.75 * Math.PI, (0.75 + 1.5 * ratio) * Math.PI);
-        c.strokeStyle = color; c.lineWidth = 5; c.lineCap = 'round'; c.stroke();
-        c.fillStyle = color; c.font = 'bold 12px Consolas'; c.textAlign = 'center';
-        c.fillText(value.toFixed(1), cx, cy + 4);
+        c.beginPath(); c.arc(cx,cy,r,0.75*Math.PI, (0.75 + 1.5 * Math.min(val/max,1)) * Math.PI);
+        c.strokeStyle = color; c.stroke();
+        c.fillStyle=color; c.font='bold 12px Consolas'; c.textAlign='center';
+        c.fillText(val.toFixed(1), cx, cy+5);
     }
 
-    setInterval(() => {
-        hudTime.innerText = new Date().toLocaleTimeString('zh-CN');
-        if(trackingStartTime) {
-            const elapsed = Math.floor((Date.now() - trackingStartTime) / 1000);
-            durationEl.innerText = Math.floor(elapsed/60).toString().padStart(2,'0') + ':' + (elapsed%60).toString().padStart(2,'0');
-        }
-    }, 1000);
-
-    let scene, camera, renderer, sphere, line, positions;
-    const MAX_POINTS = 120;
-    function init3D() {
-        const container = document.getElementById('three-container');
-        if(!container) return;
-        scene = new THREE.Scene(); scene.background = new THREE.Color(0x0a0a12);
-        camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1000);
-        renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(container.clientWidth, container.clientHeight);
-        container.appendChild(renderer.domElement);
-        scene.add(new THREE.GridHelper(20, 20, 0x00f3ff, 0x1a1a2e));
-        camera.position.set(0, 12, 18); camera.lookAt(0, 0, 0);
-        sphere = new THREE.Mesh(new THREE.SphereGeometry(0.4, 32, 32), new THREE.MeshBasicMaterial({ color: 0xff2255 }));
-        scene.add(sphere);
-        const geometry = new THREE.BufferGeometry();
-        positions = new Float32Array(MAX_POINTS * 3);
-        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        line = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x00f3ff }));
-        scene.add(line);
-        animate3D();
-    }
-    function animate3D() {
-        requestAnimationFrame(animate3D);
-        if(scene) scene.rotation.y += 0.002;
-        if(renderer && scene && camera) renderer.render(scene, camera);
-    }
-    function update3D(x, y, frameW, frameH) {
-        if(!sphere || !positions) return;
-        const x3d = (x / frameW - 0.5) * 20, z3d = (y / frameH - 0.5) * 20;
-        sphere.position.set(x3d, 0.5, z3d);
-        for(let i = (MAX_POINTS-1) * 3; i >= 3; i -= 3) {
-            positions[i] = positions[i - 3]; positions[i + 1] = positions[i - 2]; positions[i + 2] = positions[i - 1];
-        }
-        positions[0] = x3d; positions[1] = 0.5; positions[2] = z3d;
-        line.geometry.attributes.position.needsUpdate = true;
-    }
-    function reset3DTrail() {
-        if(positions) { for(let i = 0; i < positions.length; i++) positions[i] = 0; if(line) line.geometry.attributes.position.needsUpdate = true; }
-    }
-    init3D();
-
-    socket.on('connect', () => addLog('WebSocket 连接成功', 'info'));
+    // Socket listeners
     socket.on('frame_update', msg => {
-        imgEl.src = "data:image/jpeg;base64," + msg.image;
+        if(imgEl) imgEl.src = "data:image/jpeg;base64," + msg.image;
 
-        // 更新时间线和帧数
-        if(msg.frame_num !== undefined && msg.total_frames !== undefined) {
-            document.getElementById('frame-info').innerText = '帧: ' + msg.frame_num + ' / ' + msg.total_frames;
-            if(!isDraggingTimeline) {
-                timelineSlider.max = msg.total_frames;
-                timelineSlider.value = msg.frame_num;
-            }
+        if(msg.total_frames > 0 && !isDraggingTimeline && timeline) {
+            timeline.max = msg.total_frames; timeline.value = msg.frame_num;
+            if(document.getElementById('frame-info')) document.getElementById('frame-info').innerText = `帧: ${msg.frame_num} / ${msg.total_frames}`;
         }
 
         if(msg.tracking) {
-            const speed = msg.speed, accel = msg.accel || 0;
-            speedEl.innerHTML = speed.toFixed(1) + '<span class="metric-unit">px/f</span>';
-            accelEl.innerHTML = accel.toFixed(1) + '<span class="metric-unit">px/f²</span>';
-            coordEl.innerText = 'X:' + msg.x + ' Y:' + msg.y;
+            const speed = msg.speed, accel = msg.accel;
+            if(speedEl) speedEl.innerHTML = speed.toFixed(1) + '<span class="metric-unit">px/f</span>';
+            if(coordEl) coordEl.innerText = `X:${msg.x} Y:${msg.y}`;
 
-            // 音乐化追踪：播放音符
-            if(msg.music_note && config.music) {
-                const note = msg.music_note;
-                playMusicNote(note.note, note.velocity, note.instrument);
+            let state = 'IDLE';
+            if(speed < 1) state = 'STATIONARY';
+            else if(speed < 15) state = 'PATROL';
+            else state = 'HIGH SPEED';
 
-                // 显示音符信息
-                const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-                const octave = Math.floor((note.note - 12) / 12);
-                const noteName = noteNames[(note.note - 12) % 12] + octave;
-                document.getElementById('val-music-note').innerText = noteName;
-
-                const instrumentEmoji = {
-                    'piano': '🎹 钢琴',
-                    'violin': '🎻 小提琴',
-                    'drums': '🥁 鼓点',
-                    'rest': '🎵 休止'
-                };
-                document.getElementById('music-instrument').innerText = instrumentEmoji[note.instrument] || '🎵';
-            }
-
-            // 时间旅行：检测关键帧
-            if(msg.keyframe) {
-                keyframes.push(msg.keyframe);
-                document.getElementById('keyframe-count').innerText = keyframes.length;
-                addLog('🌟 关键帧: ' + msg.keyframe.event, 'info');
-                showToast('⭐ ' + msg.keyframe.event);
+            if(stateEl) {
+                stateEl.innerText = state;
+                stateEl.className = 'state-badge ' + (state==='HIGH SPEED'?'state-danger':(state==='PATROL'?'state-patrol':'state-idle'));
             }
 
             updateStats(speed, msg.x, msg.y);
             update3D(msg.x, msg.y, msg.w, msg.h);
-            if(speed > alertThreshold) { speedEl.classList.add('danger'); if(speed > lastSpeed + 5) addLog('⚠ 高速警报: ' + speed.toFixed(1), 'error'); }
-            else { speedEl.classList.remove('danger'); }
-            lastSpeed = speed;
-            const state = msg.state || 'IDLE';
-            stateEl.innerText = state; stateEl.className = 'state-badge';
-            if(state === 'STATIONARY') stateEl.classList.add('state-idle');
-            else if(state === 'PATROL') stateEl.classList.add('state-patrol');
-            else if(state === 'ALERT') stateEl.classList.add('state-alert');
-            else if(state === 'HIGH SPEED') stateEl.classList.add('state-danger');
-            chart.data.datasets[0].data.shift(); chart.data.datasets[0].data.push(speed);
-            chart.data.datasets[1].data.shift(); chart.data.datasets[1].data.push(Math.abs(accel));
-            chart.update();
             drawGauge('speed-gauge', speed, 50, '#00f3ff');
             drawGauge('accel-gauge', Math.abs(accel), 20, '#ff2255');
+
+            if(chart) {
+                chart.data.datasets[0].data.shift();
+                chart.data.datasets[0].data.push(speed);
+                chart.update('none');
+            }
+
+            if(config.particles && speed > 2) {
+                const rect = videoContainer ? videoContainer.getBoundingClientRect() : {width: 640, height: 360};
+                const pX = (msg.x / msg.w) * rect.width;
+                const pY = (msg.y / msg.h) * rect.height;
+                const count = Math.min(5, Math.floor(speed / 3));
+                for(let k=0; k<count; k++) particles.push(new Particle(pX, pY, speed));
+            }
+
+            if(msg.frame_num % 5 === 0) playSpatialNote(speed, msg.x, msg.w);
         }
     });
-    socket.on('log_message', msg => addLog(msg.text, msg.type || 'info'));
-    drawGauge('speed-gauge', 0, 50, '#00f3ff');
-    drawGauge('accel-gauge', 0, 20, '#ff2255');
+
+    socket.on('auto_detect_success', () => {
+        if(hudStatus) { hudStatus.innerText = '智能锁定'; hudStatus.style.color = '#ff00ff'; }
+        showToast('🤖 目标锁定 (置信度100%)'); resetStats();
+    });
+
+    socket.on('auto_detect_fail', () => {
+        if(hudStatus) { hudStatus.innerText = '分析中...'; hudStatus.style.color = 'orange'; }
+        showToast('⚠ 环境复杂，正在筛选目标...');
+    });
+
+    setInterval(() => { 
+        if(document.getElementById('hud-time')) document.getElementById('hud-time').innerText = new Date().toLocaleTimeString(); 
+    }, 1000);
+
 </script>
 {% endraw %}
 </body>
@@ -668,302 +642,224 @@ HTML_TEMPLATE = r'''
 '''
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'aether_secret'
+app.config['SECRET_KEY'] = 'secret'
+app.config['UPLOAD_FOLDER'] = 'uploads'
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
 
 class VideoProcessor:
     def __init__(self):
-        # 优化：尝试打开视频文件，如果失败则打开摄像头（索引0）
-        self.video_path = 'supermario.mp4'
+        self.trail_history = deque(maxlen=50)
+        self.tracking_data = []
+        self.video_path = None
+        self.source_type = 'file'
         self.cap = None
-
-        if os.path.exists(self.video_path):
-            self.cap = cv2.VideoCapture(self.video_path)
-            print(f"[INFO] 成功加载视频文件: {self.video_path}")
-
-        # 如果文件加载失败，尝试打开摄像头 (Index 0)
-        # 添加 cv2.CAP_DSHOW 增加 Windows 兼容性
-        if self.cap is None or not self.cap.isOpened():
-            print(f"[WARN] 视频文件无效，尝试打开摄像头 (Index 0)...")
-            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-        if not self.cap.isOpened():
-            print(f"[ERROR] 严重错误：无法打开任何视频源！")
-
         self.tracker = None
         self.tracking = False
         self.paused = False
+        self.config = {'kalman': True, 'trail': True, 'overlay': True, 'preprocess': True, 'particles': True}
+        self.view_mode = 'original'
         self.current_frame = None
+        self.last_pos = None
+        self.last_speed = 0
         self.tracker_type = 'CSRT'
-        self.config = {'kalman': True, 'trail': True, 'overlay': True, 'heatmap': False, 'music': False}
-        self.alert_threshold = 25
+
+        self.detect_counter = 0
+        self.last_detected_rect = None
+
         self.kalman = cv2.KalmanFilter(4, 2)
         self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
         self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
         self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.last_pos = None
-        self.last_speed = 0
-        self.trail_history = deque(maxlen=100)
-        self.heatmap = None
-        self.tracking_data = []
-        self.keyframes = []
 
-        if self.cap and self.cap.isOpened():
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.backSub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+
+        default_video = 'supermario.mp4'
+        if os.path.exists(default_video):
+            self.load_video_source(default_video)
         else:
-            self.total_frames = 0
-            self.fps = 30
+            self.load_camera_source()
 
-        self.current_frame_num = 0
-        self.music_notes = deque(maxlen=50)
-        self.last_note_time = 0
+    def load_video_source(self, path):
+        if self.cap: self.cap.release()
+        self.cap = cv2.VideoCapture(path)
+        self.video_path = path
+        self.source_type = 'file'
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.reset_state()
+        print(f"[INFO] Loaded video: {path}")
 
-    def create_tracker(self):
+    def load_camera_source(self):
+        if self.cap: self.cap.release()
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.source_type = 'camera'
+        self.total_frames = 0
+        self.reset_state()
+        print(f"[INFO] Loaded camera")
+
+    def reset_state(self):
+        self.tracking = False
+        self.tracker = None
+        self.paused = False
+        self.trail_history.clear()
+        self.tracking_data = []
+        self.current_frame = None
+        self.detect_counter = 0
+
+    def reset_kalman(self):
+        self.kalman.statePre = np.zeros((4, 1), np.float32)
+        self.kalman.statePost = np.zeros((4, 1), np.float32)
+
+    def init_tracker(self, frame, bbox):
         trackers = {
             'CSRT': cv2.TrackerCSRT_create,
             'KCF': cv2.TrackerKCF_create,
             'MIL': cv2.TrackerMIL_create,
-            'MOSSE': cv2.legacy.TrackerMOSSE_create if hasattr(cv2, 'legacy') else cv2.TrackerCSRT_create
+            'MOSSE': cv2.legacy.TrackerMOSSE_create if hasattr(cv2.legacy,
+                                                               'TrackerMOSSE_create') else cv2.TrackerCSRT_create
         }
-        return trackers.get(self.tracker_type, cv2.TrackerCSRT_create)()
-
-    def reset_kalman(self):
-        self.kalman = cv2.KalmanFilter(4, 2)
-        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-
-    def init_tracker(self, norm_rect, frame_w, frame_h):
-        x = int(norm_rect['x'] * frame_w)
-        y = int(norm_rect['y'] * frame_h)
-        w = int(norm_rect['w'] * frame_w)
-        h = int(norm_rect['h'] * frame_h)
-        self.tracker = self.create_tracker()
-        self.init_bbox = (x, y, w, h)
-        self.tracking = False
+        self.tracker = trackers.get(self.tracker_type, cv2.TrackerCSRT_create)()
+        self.tracker.init(frame, bbox)
+        self.tracking = True
         self.last_pos = None
-        self.last_speed = 0
         self.trail_history.clear()
-        self.tracking_data = []
         self.reset_kalman()
-        if self.current_frame is not None:
-            self.heatmap = np.zeros((self.current_frame.shape[0], self.current_frame.shape[1]), dtype=np.float32)
+        print(f"Tracker initialized: {bbox}")
 
-    def reset_tracking(self):
-        self.tracking = False
-        self.tracker = None
-        self.last_pos = None
-        self.last_speed = 0
-        self.trail_history.clear()
-        if hasattr(self, 'init_bbox'):
-            del self.init_bbox
+    def preprocess_frame(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        equalized = cv2.equalizeHist(blurred)
+        return equalized
 
-    def get_motion_state(self, speed):
-        if speed < 1.0:
-            return 'STATIONARY'
-        elif speed < 10.0:
-            return 'PATROL'
-        elif speed < self.alert_threshold:
-            return 'ALERT'
+    def auto_detect_target(self):
+        if self.current_frame is None: return False
+
+        mask = self.backSub.apply(self.current_frame)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        max_area = 0
+        best_rect = None
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 500 < area < (self.current_frame.shape[0] * self.current_frame.shape[1] * 0.6):
+                if area > max_area:
+                    max_area = area
+                    best_rect = cv2.boundingRect(cnt)
+
+        if best_rect:
+            if self.last_detected_rect:
+                cx1, cy1 = best_rect[0], best_rect[1]
+                cx2, cy2 = self.last_detected_rect[0], self.last_detected_rect[1]
+                dist = np.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
+                if dist < 50:
+                    self.detect_counter += 1
+                else:
+                    self.detect_counter = 0
+
+            self.last_detected_rect = best_rect
+
+            if self.detect_counter > 5:
+                self.init_tracker(self.current_frame, best_rect)
+                self.detect_counter = 0
+                return True
         else:
-            return 'HIGH SPEED'
+            self.detect_counter = 0
 
-    def speed_to_music_note(self, speed, accel):
-        note = int(48 + min(speed, 50) * 0.72)
-        velocity = int(64 + min(abs(accel), 20) * 3)
-        if speed < 1.0:
-            instrument = 'rest'
-        elif speed < 10.0:
-            instrument = 'piano'
-        elif speed < 25.0:
-            instrument = 'violin'
-        else:
-            instrument = 'drums'
-        return {'note': note, 'velocity': velocity, 'instrument': instrument, 'speed': speed}
-
-    def detect_keyframe(self, speed, accel, state):
-        current_time = time.time()
-        is_keyframe = False
-        event_type = None
-
-        if abs(accel) > 15:
-            is_keyframe = True
-            event_type = '急加速' if accel > 0 else '急减速'
-        elif speed > self.alert_threshold * 1.5:
-            is_keyframe = True
-            event_type = '极速运动'
-        elif state == 'STATIONARY' and self.last_speed > 10:
-            is_keyframe = True
-            event_type = '突然停止'
-        elif len(self.keyframes) == 0 and self.tracking:
-            is_keyframe = True
-            event_type = '追踪开始'
-
-        if is_keyframe and (len(self.keyframes) == 0 or current_time - self.keyframes[-1]['time'] > 2):
-            keyframe = {
-                'frame_num': self.current_frame_num,
-                'time': current_time,
-                'speed': speed,
-                'accel': accel,
-                'event': event_type,
-                'timestamp': datetime.datetime.now().isoformat()
-            }
-            self.keyframes.append(keyframe)
-            return keyframe
-        return None
-
-    def seek_to_frame(self, frame_num):
-        if 0 <= frame_num < self.total_frames:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            self.current_frame_num = frame_num
-            return True
         return False
 
-    def get_keyframes_list(self):
-        return self.keyframes
-
-    def get_frame_data(self):
-        if self.cap is None or not self.cap.isOpened():
-            return None
+    def process_frame(self):
+        if self.cap is None or not self.cap.isOpened(): return None
 
         if self.paused and self.current_frame is not None:
-            _, buffer = cv2.imencode('.jpg', self.current_frame)
-            img_str = base64.b64encode(buffer).decode('utf-8')
-            return {'image': img_str, 'tracking': self.tracking,
-                    'x': self.last_pos[0] if self.last_pos else 0,
-                    'y': self.last_pos[1] if self.last_pos else 0,
-                    'w': self.current_frame.shape[1], 'h': self.current_frame.shape[0],
-                    'speed': self.last_speed, 'accel': 0, 'state': self.get_motion_state(self.last_speed)}
-
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            display_frame = self.current_frame.copy()
+        else:
             ret, frame = self.cap.read()
-            if not ret or frame is None:
-                return None
-        self.current_frame = frame.copy()
-        speed, accel, cx, cy, state = 0, 0, 0, 0, 'IDLE'
+            if not ret:
+                if self.source_type == 'file':
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                return self.process_frame()
+            self.current_frame = frame.copy()
+            display_frame = frame
 
-        keyframe = None
-        music_note = None
+        preprocessed = self.preprocess_frame(self.current_frame)
+        motion_mask = self.backSub.apply(self.current_frame)
 
-        if hasattr(self, 'init_bbox'):
-            if frame is not None and frame.size > 0 and self.tracker is not None:
-                try:
-                    x, y, w, h = self.init_bbox
-                    if w > 0 and h > 0 and x >= 0 and y >= 0:
-                        self.tracker.init(frame, self.init_bbox)
-                        self.tracking = True
-                        self.heatmap = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.float32)
-                        print(f"[INFO] 追踪器初始化成功: bbox={self.init_bbox}")
-                    else:
-                        print(f"[WARN] 无效的边界框: {self.init_bbox}")
-                except Exception as e:
-                    print(f"[ERROR] 追踪器初始化失败: {e}")
-                    self.tracking = False
-            del self.init_bbox
-
-        if self.config['overlay']:
-            h, w = frame.shape[:2]
-            cv2.line(frame, (w // 2 - 30, h // 2), (w // 2 + 30, h // 2), (80, 80, 80), 1)
-            cv2.line(frame, (w // 2, h // 2 - 30), (w // 2, h // 2 + 30), (80, 80, 80), 1)
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(frame, f"REC {ts}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.rectangle(frame, (5, 5), (w - 5, h - 5), (40, 40, 40), 1)
+        cx, cy, speed, accel = 0, 0, 0, 0
 
         if self.tracking:
-            success, bbox = self.tracker.update(frame)
+            success, bbox = self.tracker.update(self.current_frame)
             if success:
-                cx = int(bbox[0] + bbox[2] / 2)
-                cy = int(bbox[1] + bbox[3] / 2)
+                cx_raw = int(bbox[0] + bbox[2] / 2)
+                cy_raw = int(bbox[1] + bbox[3] / 2)
+
                 if self.config['kalman']:
-                    self.kalman.correct(np.array([[np.float32(cx)], [np.float32(cy)]]))
+                    mp = np.array([[np.float32(cx_raw)], [np.float32(cy_raw)]])
+                    self.kalman.correct(mp)
                     pred = self.kalman.predict()
-                    px, py = int(pred[0]), int(pred[1])
+                    cx, cy = int(pred[0]), int(pred[1])
                 else:
-                    px, py = cx, cy
+                    cx, cy = cx_raw, cy_raw
+
                 if self.last_pos:
-                    speed = np.sqrt((px - self.last_pos[0]) ** 2 + (py - self.last_pos[1]) ** 2)
+                    dist = np.sqrt((cx - self.last_pos[0]) ** 2 + (cy - self.last_pos[1]) ** 2)
+                    speed = dist
                     accel = speed - self.last_speed
-                self.last_pos = (px, py)
+
+                self.last_pos = (cx, cy)
                 self.last_speed = speed
-                state = self.get_motion_state(speed)
-                self.trail_history.append((px, py))
+                self.trail_history.append((cx, cy))
 
-                self.current_frame_num = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                self.tracking_data.append([
+                    datetime.datetime.now().strftime("%H:%M:%S.%f"),
+                    cx, cy, round(speed, 2), round(accel, 2)
+                ])
 
-                if self.config.get('music', False):
-                    current_time = time.time()
-                    if current_time - self.last_note_time > 0.1:
-                        music_note = self.speed_to_music_note(speed, accel)
-                        self.music_notes.append(music_note)
-                        self.last_note_time = current_time
+                if self.config['overlay']:
+                    p1 = (int(bbox[0]), int(bbox[1]))
+                    p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
+                    cv2.rectangle(display_frame, p1, p2, (0, 243, 255), 2)
+                    cv2.putText(display_frame, f"TARGET LOCKED", (p1[0], p1[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 243, 255), 1)
 
-                keyframe = self.detect_keyframe(speed, accel, state)
+                    if self.config['trail'] and len(self.trail_history) > 1:
+                        pts = list(self.trail_history)
+                        for i in range(1, len(pts)):
+                            thickness = int(np.sqrt(i / len(pts)) * 3) + 1
+                            cv2.line(display_frame, pts[i - 1], pts[i], (0, 255, 136), thickness)
 
-                if self.config['heatmap'] and self.heatmap is not None:
-                    cv2.circle(self.heatmap, (px, py), 20, 1, -1)
-                self.tracking_data.append({
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    'x': px, 'y': py, 'speed': speed, 'accel': accel, 'state': state
-                })
-                p1 = (int(bbox[0]), int(bbox[1]))
-                p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-                color = (0, 0, 255) if speed > self.alert_threshold else (0, 165, 255) if speed > 10 else (255, 255, 0)
-                cv2.rectangle(frame, p1, p2, color, 1)
-                l = 15
-                cv2.line(frame, p1, (p1[0] + l, p1[1]), color, 2)
-                cv2.line(frame, p1, (p1[0], p1[1] + l), color, 2)
-                cv2.line(frame, (p2[0], p1[1]), (p2[0] - l, p1[1]), color, 2)
-                cv2.line(frame, (p2[0], p1[1]), (p2[0], p1[1] + l), color, 2)
-                cv2.line(frame, (p1[0], p2[1]), (p1[0] + l, p2[1]), color, 2)
-                cv2.line(frame, (p1[0], p2[1]), (p1[0], p2[1] - l), color, 2)
-                cv2.line(frame, p2, (p2[0] - l, p2[1]), color, 2)
-                cv2.line(frame, p2, (p2[0], p2[1] - l), color, 2)
-                if self.config['trail'] and len(self.trail_history) > 1:
-                    points = list(self.trail_history)
-                    for i in range(1, len(points)):
-                        alpha = i / len(points)
-                        thickness = max(1, int(alpha * 3))
-                        pt_color = (int(255 * alpha), int(255 * (1 - alpha)), 255)
-                        cv2.line(frame, points[i - 1], points[i], pt_color, thickness)
-                if self.config['kalman']:
-                    cv2.line(frame, (cx, cy), (px, py), (0, 255, 0), 1)
-                    cv2.circle(frame, (px, py), 4, (0, 255, 0), -1)
-                cv2.putText(frame, f"{state} | V:{speed:.1f}", (p1[0], p1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            color, 1)
-                cx, cy = px, py
-        if self.config['heatmap'] and self.heatmap is not None and self.tracking:
-            heatmap_normalized = cv2.normalize(self.heatmap, None, 0, 255, cv2.NORM_MINMAX)
-            heatmap_colored = cv2.applyColorMap(heatmap_normalized.astype(np.uint8), cv2.COLORMAP_JET)
-            frame = cv2.addWeighted(frame, 0.7, heatmap_colored, 0.3, 0)
-        self.current_frame = frame
-        _, buffer = cv2.imencode('.jpg', frame)
-        img_str = base64.b64encode(buffer).decode('utf-8')
+        output_image = display_frame
+        if self.view_mode == 'preprocessed':
+            output_image = preprocessed
+        elif self.view_mode == 'mask':
+            output_image = motion_mask
 
-        result = {
-            'image': img_str, 'tracking': self.tracking, 'x': cx, 'y': cy,
-            'w': frame.shape[1], 'h': frame.shape[0], 'speed': speed, 'accel': accel, 'state': state,
-            'frame_num': self.current_frame_num, 'total_frames': self.total_frames
+        _, buffer = cv2.imencode('.jpg', output_image)
+        b64_img = base64.b64encode(buffer).decode('utf-8')
+
+        return {
+            'image': b64_img,
+            'tracking': self.tracking,
+            'x': cx, 'y': cy, 'speed': speed, 'accel': accel,
+            'w': self.current_frame.shape[1],
+            'h': self.current_frame.shape[0],
+            'frame_num': int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)),
+            'total_frames': self.total_frames
         }
 
-        if self.tracking and music_note:
-            result['music_note'] = music_note
-
-        if keyframe:
-            result['keyframe'] = keyframe
-
-        return result
-
-    def export_data(self):
-        if not self.tracking_data: return None
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=['timestamp', 'x', 'y', 'speed', 'accel', 'state'])
-        writer.writeheader()
-        writer.writerows(self.tracking_data)
-        return output.getvalue()
+    def export_csv(self):
+        si = io.StringIO()
+        cw = csv.writer(si)
+        cw.writerow(['Timestamp', 'X', 'Y', 'Speed', 'Accel'])
+        cw.writerows(self.tracking_data)
+        return si.getvalue()
 
 
 processor = VideoProcessor()
@@ -974,53 +870,72 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+@app.route('/upload_video', methods=['POST'])
+def upload_video():
+    if 'video' not in request.files:
+        return jsonify({'success': False, 'error': 'No file part'})
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No selected file'})
+
+    if file:
+        filename = "upload_" + str(int(time.time())) + ".mp4"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        processor.load_video_source(filepath)
+        return jsonify({'success': True, 'filename': filename})
+
+
 @app.route('/export_data')
 def export_data():
-    csv_data = processor.export_data()
-    if csv_data:
-        output = io.BytesIO()
-        output.write(csv_data.encode('utf-8'))
-        output.seek(0)
-        return send_file(output, mimetype='text/csv', as_attachment=True,
-                         download_name=f'tracking_data_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
-    return jsonify({'error': 'No data available'}), 404
+    data = processor.export_csv()
+    mem = io.BytesIO()
+    mem.write(data.encode('utf-8'))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name='tracking_data.csv', mimetype='text/csv')
 
 
 @socketio.on('connect')
 def handle_connect():
-    print(f"[WS] 客户端连接: {threading.current_thread().name}")
-    emit('log_message', {'text': '服务端连接成功', 'type': 'info'})
-    socketio.start_background_task(stream_video)
-
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    print(f"[WS] 客户端断开")
+    socketio.start_background_task(video_stream_task)
 
 
 @socketio.on('start_tracking')
-def handle_track(data):
+def handle_start(data):
     if processor.current_frame is not None:
         h, w = processor.current_frame.shape[:2]
-        processor.init_tracker(data, w, h)
-        emit('log_message', {'text': f'追踪初始化: {processor.tracker_type}', 'type': 'info'})
+        x = int(data['x'] * w)
+        y = int(data['y'] * h)
+        bw = int(data['w'] * w)
+        bh = int(data['h'] * h)
+        processor.init_tracker(processor.current_frame, (x, y, bw, bh))
+
+
+@socketio.on('auto_detect')
+def handle_auto_detect():
+    success = processor.auto_detect_target()
+    if success:
+        emit('auto_detect_success')
+    else:
+        emit('auto_detect_fail')
 
 
 @socketio.on('reset_tracking')
 def handle_reset():
-    processor.reset_tracking()
-    emit('log_message', {'text': '追踪已重置', 'type': 'warn'})
+    processor.tracking = False
+    processor.tracker = None
+    processor.trail_history.clear()
 
 
 @socketio.on('toggle_pause')
 def handle_pause(data):
-    processor.paused = data.get('paused', False)
+    processor.paused = data['paused']
 
 
-@socketio.on('change_tracker')
-def handle_change_tracker(data):
-    processor.tracker_type = data.get('tracker', 'CSRT')
-    emit('log_message', {'text': f'算法切换: {processor.tracker_type}', 'type': 'info'})
+@socketio.on('switch_source')
+def handle_switch_source(data):
+    if data['type'] == 'camera':
+        processor.load_camera_source()
 
 
 @socketio.on('update_config')
@@ -1028,52 +943,31 @@ def handle_config(data):
     processor.config.update(data)
 
 
-@socketio.on('set_threshold')
-def handle_threshold(data):
-    processor.alert_threshold = data.get('threshold', 25)
+@socketio.on('set_view_mode')
+def handle_view_mode(data):
+    processor.view_mode = data['mode']
 
 
-@socketio.on('seek_to_frame')
-def handle_seek_frame(data):
-    frame_num = data.get('frame_num', 0)
-    if processor.seek_to_frame(frame_num):
-        emit('log_message', {'text': f'⏰ 时间旅行到帧: {frame_num}', 'type': 'info'})
-    else:
-        emit('log_message', {'text': '跳转失败', 'type': 'error'})
+@socketio.on('change_tracker')
+def handle_tracker_change(data):
+    processor.tracker_type = data['tracker']
 
 
-@socketio.on('get_keyframes')
-def handle_get_keyframes():
-    keyframes = processor.get_keyframes_list()
-    emit('keyframes_list', {'keyframes': keyframes})
+@socketio.on('seek_frame')
+def handle_seek(data):
+    if processor.cap.isOpened() and processor.source_type == 'file':
+        processor.cap.set(cv2.CAP_PROP_POS_FRAMES, data['frame'])
 
 
-def stream_video():
+def video_stream_task():
     while True:
-        data = processor.get_frame_data()
+        data = processor.process_frame()
         if data:
             socketio.emit('frame_update', data)
-        socketio.sleep(0.033)
-
-
-def find_free_port(start=5000, end=5100):
-    import socket
-    for port in range(start, end):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('127.0.0.1', port))
-                return port
-        except OSError:
-            continue
-    return start
+        socketio.sleep(0.03)
 
 
 if __name__ == '__main__':
-    port = find_free_port()
-    print("=" * 50)
-    print("  AETHER // 智能视觉追踪系统 v2.0")
-    print("=" * 50)
-    print("  启动中...")
-    print(f"  请在浏览器打开: http://127.0.0.1:{port}")
-    print("=" * 50)
-    socketio.run(app, debug=False, port=port, allow_unsafe_werkzeug=True)
+    print("Starting AETHER Tracking System v4.1 Stable...")
+    socketio.run(app, debug=False, port=5000, allow_unsafe_werkzeug=True)
+
